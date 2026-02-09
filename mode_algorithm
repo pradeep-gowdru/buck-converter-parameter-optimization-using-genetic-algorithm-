@@ -1,0 +1,150 @@
+import numpy as np
+
+
+class BuckConverterMODE:
+    def __init__(
+        self,
+        Vin,
+        Vout,
+        Iout,
+        fs_min=150e3,
+        fs_max=300e3,
+        ripple_percent=15,
+        pop_size=50,
+        generations=100,
+    ):
+        self.Vin = Vin
+        self.Vout = Vout
+        self.Iout = Iout
+        self.D_ref = Vout / Vin
+        self.fs_min = fs_min
+        self.fs_max = fs_max
+        self.ripple_target = (ripple_percent / 100) * Iout
+
+        self.pop_size = pop_size
+        self.generations = generations
+
+        # DE parameters
+        self.F = 0.6  # Differential weight
+        self.CR = 0.8  # Crossover probability
+
+        # Variable bounds
+        self.bounds = np.array(
+            [
+                [5e-6, 20e-6],  # L
+                [10e-6, 50e-6],  # C
+                [fs_min, fs_max],  # fs
+                [0.3, 0.7],  # D
+                [5e-3, 30e-3],  # ESR
+                [5e-3, 30e-3],  # DCR
+            ]
+        )
+
+    # -------------------------------------------------
+    # Buck model
+    # -------------------------------------------------
+    def evaluate(self, x):
+        L, C, fs, D, ESR, DCR = x
+
+        # -------- Buck equations --------
+        delta_IL = (self.Vin - self.Vout) * D / (L * fs)
+        delta_Vo = delta_IL / (8 * fs * C)
+        delta_Vo_total = delta_Vo + delta_IL * ESR
+
+        conduction_loss = self.Iout**2 * DCR
+        switching_loss = 0.5 * self.Vin * self.Iout * 40e-9 * fs
+        total_loss = conduction_loss + switching_loss
+
+        efficiency = (self.Vout * self.Iout) / (self.Vout * self.Iout + total_loss)
+
+        # -------- Objectives (minimize) --------
+        f1 = -efficiency
+        f2 = abs(delta_IL - self.ripple_target)
+
+        # -------- Constraint penalties --------
+        penalty = 0.0
+
+        # CCM ripple constraint
+        if delta_IL > 0.3 * self.Iout:
+            penalty += (delta_IL - 0.3 * self.Iout) * 50
+
+        # Minimum efficiency
+        if efficiency < 0.85:
+            penalty += (0.85 - efficiency) * 100
+
+        # Duty cycle constraint
+        if abs(D - self.D_ref) > 0.05:
+            penalty += abs(D - self.D_ref) * 50
+
+        # Optional voltage ripple constraint
+        if delta_Vo_total > 0.05 * self.Vout:
+            penalty += delta_Vo_total * 20
+
+        # -------- Penalized objectives --------
+        f1 += penalty
+        f2 += penalty
+
+        return np.array([f1, f2])
+
+    # -------------------------------------------------
+    # Initialize population
+    # -------------------------------------------------
+    def initialize(self):
+        pop = []
+        for _ in range(self.pop_size):
+            x = np.array([np.random.uniform(*b) for b in self.bounds])
+            pop.append(x)
+        return np.array(pop)
+
+    # -------------------------------------------------
+    # Differential Evolution
+    # -------------------------------------------------
+    def run(self):
+        pop = self.initialize()
+        fitness = np.array([self.evaluate(x) for x in pop])
+
+        for _ in range(self.generations):
+            for i in range(self.pop_size):
+                # Mutation: vi = a + F(b − c)
+                idxs = [idx for idx in range(self.pop_size) if idx != i]
+                a, b, c = pop[np.random.choice(idxs, 3, replace=False)]
+                mutant = a + self.F * (b - c)
+
+                # Bound control
+                mutant = np.clip(mutant, self.bounds[:, 0], self.bounds[:, 1])
+
+                # Crossover
+                trial = np.copy(pop[i])
+                for j in range(len(trial)):
+                    if np.random.rand() < self.CR:
+                        trial[j] = mutant[j]
+
+                # Selection (Pareto dominance)
+                f_trial = self.evaluate(trial)
+                f_target = fitness[i]
+
+                if np.all(f_trial <= f_target) and np.any(f_trial < f_target):
+                    pop[i] = trial
+                    fitness[i] = f_trial
+
+        return pop, fitness
+
+
+# --- User inputs (edit these) ---
+Vin = 12.0
+Vout = 5.0
+Iout = 5.0
+
+mode = BuckConverterMODE(Vin=Vin, Vout=Vout, Iout=Iout)
+
+pop, fit = mode.run()
+best_idx = np.argmin(fit[:, 0])  # max efficiency
+best = pop[best_idx]
+
+print("Optimized MODE Design:")
+print(f"L  = {best[0]*1e6:.2f} µH")
+print(f"C  = {best[1]*1e6:.2f} µF")
+print(f"fs = {best[2]/1e3:.2f} kHz")
+print(f"D  = {best[3]:.3f}")
+print(f"ESR= {best[4]*1e3:.2f} mΩ")
+print(f"DCR= {best[5]*1e3:.2f} mΩ")
