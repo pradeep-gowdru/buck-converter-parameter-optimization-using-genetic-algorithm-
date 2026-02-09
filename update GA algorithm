@@ -1,0 +1,284 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+class BuckConverterGA:
+    def __init__(
+        self ,
+        Vin,
+        Vout,
+        Iout,
+        fs_min=150e3,
+        fs_max=300e3,
+        ripple_percent=15,
+        population_size=50,
+        generations=100
+    ):
+        # User-defined electrical parameters
+        self.Vin = Vin
+        self.Vout = Vout
+        self.Iout = Iout
+        self.D_ref = Vout / Vin
+
+        # Switching frequency range
+        self.fs_min = fs_min
+        self.fs_max = fs_max
+
+        # Target ripple
+        self.ripple_target = (ripple_percent / 100) * Iout
+
+        # GA parameters
+        self.pop_size = population_size
+        self.generations = generations
+
+        self.mutation_rate_max = 0.3   # High mutation at early generations
+        self.mutation_rate_min = 0.05  # Low mutation at later generations
+        self.mutation_rate = 0.2
+        self.crossover_rate = 0.8
+        self.immigrant_rate = 0.1   # 10% random immigrants per generation
+    # -------------------------------------------------
+    # Initialize population
+    # -------------------------------------------------
+    def initialize_population(self):
+        population = []
+        for _ in range(self.pop_size):
+            individual = {
+                'L': np.random.uniform(5e-6, 20e-6),
+                'C': np.random.uniform(10e-6, 50e-6),
+                'fs': np.random.uniform(self.fs_min, self.fs_max),
+                'D': np.random.uniform(0.6, 0.7),
+                'ESR': np.random.uniform(5e-3, 30e-3),
+                'DCR': np.random.uniform(5e-3, 30e-3)
+            }
+            population.append(individual)
+        return population
+
+    # -------------------------------------------------
+    # Buck converter CCM model
+    # -------------------------------------------------
+    def simulate_buck_converter(self, p):
+        L, C, fs, D = p['L'], p['C'], p['fs'], p['D']
+        DCR = p['DCR']
+
+        # Inductor current ripple
+        delta_IL = (self.Vin - self.Vout) * D / (L * fs)
+
+        # Output voltage ripple
+        delta_Vo = delta_IL / (8 * fs * C)
+
+        # Loss calculations
+        conduction_loss = self.Iout**2 * DCR
+        tr_tf = 40e-9
+        switching_loss = 0.5 * self.Vin * self.Iout * tr_tf * fs
+
+        total_loss = conduction_loss + switching_loss
+
+        efficiency = (self.Vout * self.Iout) / (self.Vout * self.Iout + total_loss)
+
+        return {
+            'ΔIL': delta_IL,
+            'ΔVo': delta_Vo,
+            'efficiency': efficiency
+        }
+
+    # -------------------------------------------------
+    # Fitness function
+    # -------------------------------------------------
+    def fitness(self, individual):
+        r = self.simulate_buck_converter(individual)
+
+        ΔIL = r['ΔIL']
+        efficiency = r['efficiency']
+        L = individual['L']
+        D = individual['D']
+
+        fitness = 0
+
+        # Efficiency reward
+        fitness += 100 * efficiency
+
+        # Ripple targeting
+        ripple_error = abs(ΔIL - self.ripple_target)
+        fitness += max(0, 30 - 10 * ripple_error)
+
+        # Penalize large inductance
+        if L > 15e-6:
+            fitness -= 50 * (L / 15e-6)
+
+        # Constraints
+        penalty = 0
+        if ΔIL > 0.3 * self.Iout:
+            penalty += 40
+        if efficiency < 0.85:
+            penalty += 40
+        if abs(D - self.D_ref) > 0.05:
+            penalty += 30
+
+        return max(0, fitness - penalty)
+
+    # -------------------------------------------------
+    # Crossover
+    # -------------------------------------------------
+    def crossover(self, p1, p2):
+        c1, c2 = {}, {}
+        for k in p1:
+            if np.random.rand() < 0.5:
+                c1[k], c2[k] = p1[k], p2[k]
+            else:
+                c1[k], c2[k] = p2[k], p1[k]
+        return c1, c2
+
+    # -------------------------------------------------
+    # Mutation
+    # -------------------------------------------------
+    def mutate(self, ind):
+        for k in ind:
+            if np.random.rand() < self.mutation_rate:
+                if k == 'L':
+                    ind[k] *= np.random.uniform(0.85, 1.05)
+                    ind[k] = np.clip(ind[k], 5e-6, 20e-6)
+                elif k == 'C':
+                    ind[k] *= np.random.uniform(0.9, 1.1)
+                    ind[k] = np.clip(ind[k], 10e-6, 50e-6)
+
+                elif k == 'fs':
+                    ind[k] *= np.random.uniform(0.9, 1.1)
+                    ind[k] = np.clip(ind[k], self.fs_min, self.fs_max)
+
+                elif k == 'D':
+                    ind[k] *= np.random.uniform(0.95, 1.05)
+                    ind[k] = np.clip(ind[k], 0.3, 0.7)
+
+                elif k == 'ESR':
+                    ind[k] *= np.random.uniform(0.9, 1.1)
+                    ind[k] = np.clip(ind[k], 5e-3, 30e-3)
+
+                elif k == 'DCR':
+                    ind[k] *= np.random.uniform(0.9, 1.1)
+                    ind[k] = np.clip(ind[k], 5e-3, 30e-3)
+        return ind
+
+    # -------------------------------------------------
+    # Adaptive mutation function
+    # Linearly decreases mutation rate over generations
+    # -------------------------------------------------
+    def update_mutation_rate(self, generation):
+        self.mutation_rate = (
+            self.mutation_rate_max
+            - (generation / self.generations)
+            * (self.mutation_rate_max - self.mutation_rate_min)
+        )
+
+    # -------------------------------------------------
+    # Run GA
+    # -------------------------------------------------
+    def run(self):
+        population = self.initialize_population()
+        best_fitness_history = []
+        mutation_history = []
+
+        for generation in range(self.generations):
+            fitness_scores = [self.fitness(ind) for ind in population]
+            best_fitness_history.append(max(fitness_scores))
+
+            # Update adaptive mutation rate
+            self.update_mutation_rate(generation)
+            mutation_history.append(self.mutation_rate)
+
+            # -------------------------
+            # Tournament Selection
+            # -------------------------
+            new_population = []
+            for _ in range(self.pop_size):
+                idx = np.random.choice(len(population), 3, replace=False)
+                winner = population[idx[np.argmax([fitness_scores[i] for i in idx])]]
+                new_population.append(winner.copy())
+
+            # -------------------------
+            # Crossover + Mutation
+            # -------------------------
+            for i in range(0, self.pop_size - 1, 2):
+                if np.random.rand() < self.crossover_rate:
+                    c1, c2 = self.crossover(new_population[i], new_population[i + 1])
+                    new_population[i] = self.mutate(c1)
+                    new_population[i + 1] = self.mutate(c2)
+
+            # -------------------------
+            # Random Immigrants
+            # -------------------------
+            num_immigrants = int(self.immigrant_rate * self.pop_size)
+            immigrants = self.initialize_population()[:num_immigrants]
+
+            # Replace worst individuals
+            fitness_new = [self.fitness(ind) for ind in new_population]
+            worst_indices = np.argsort(fitness_new)[:num_immigrants]
+
+            for i, idx in enumerate(worst_indices):
+                new_population[idx] = immigrants[i]
+
+            population = new_population
+
+        best_individual = population[np.argmax([self.fitness(i) for i in population])]
+        return best_individual, best_fitness_history, mutation_history
+
+# -------------------------------------------------
+# MAIN PROGRAM (USER INPUT + DISPLAY)
+# -------------------------------------------------
+if __name__ == "__main__":
+    #np.random.seed(42)
+    Vin = float(input("Enter input voltage Vin (V): "))
+    Vout = float(input("Enter output voltage Vout (V): "))
+    Iout = float(input("Enter load current Iout (A): "))
+    ripple_percent = float(input("Enter target current ripple (% of Iout): "))
+
+    fs_min = 150e3
+    fs_max = 300e3
+
+    print("\n================ SIMULATION INPUT SUMMARY ================\n")
+    print(f"Input Voltage (Vin)        : {Vin:.2f} V")
+    print(f"Output Voltage (Vout)      : {Vout:.2f} V")
+    print(f"Load Current (Iout)        : {Iout:.2f} A")
+    print(f"Target Ripple              : {ripple_percent:.1f} %")
+    print(f"Switching Frequency Range  : {fs_min/1e3:.0f} – {fs_max/1e3:.0f} kHz")
+    print(f"Population Size            : 50")
+    print(f"Generations                : 100")
+ #   print("\n==========================================================\n")
+
+    ga = BuckConverterGA(
+        Vin=Vin,
+        Vout=Vout,
+        Iout=Iout,
+        fs_min=fs_min,
+        fs_max=fs_max,
+        ripple_percent=ripple_percent,
+        population_size=50,
+        generations=100
+    )
+
+    best_params, fitness_history, mutation_history = ga.run()
+
+    print("\n================ OPTIMIZED RESULTS ================\n")
+    for k, v in best_params.items():
+        if k in ['L', 'C']:
+            print(f"{k} : {v*1e6:.2f} µ")
+        elif k == 'fs':
+            print(f"{k} : {v/1e3:.2f} kHz")
+        else:
+            print(f"{k} : {v:.6f}")
+
+    print("\n=================================================\n")
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(fitness_history)
+    plt.xlabel("Generation")
+    plt.ylabel("Best Fitness")
+    plt.title("GA Convergence for Buck Converter Optimization")
+    plt.grid(True)
+    plt.show()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(mutation_history)
+    plt.xlabel("Generation")
+    plt.ylabel("Mutation Rate")
+    plt.title("Adaptive Mutation Schedule")
+    plt.grid(True)
+    plt.show()
